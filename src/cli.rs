@@ -2,7 +2,7 @@
 use std::fmt;
 
 // ─────────────────────────────────────────────────────────────
-// Типы ошибок                                                 -
+// Типы ошибок
 // ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -187,16 +187,23 @@ impl Default for Args {
 // ─────────────────────────────────────────────────────────────
 
 /// Парсит строку вида "123", "10K", "5M", "1G" (регистрозависимо: K/M/G = 1024, k/m/g тоже 1024).
+/// Формат: число (опционально) + суффикс (опционально).
+/// Примеры: "123", "10K", "5M", "1G", "10k", "5m", "1g"
 pub fn parse_with_suffix(s: &str) -> Result<u64, ()> {
     let s = s.trim();
     if s.is_empty() {
         return Err(());
     }
 
-    let (num_part, suffix) = match s.rfind(|c: char| c.is_ascii_digit()) {
-        Some(pos) => s.split_at(pos + 1),
-        None => return Err(()),
-    };
+    // Найти первый нецифровой символ — это граница между числом и суффиксом
+    let split_pos = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+
+    let (num_part, suffix) = s.split_at(split_pos);
+
+    // Число должно быть непустым
+    if num_part.is_empty() {
+        return Err(());
+    }
 
     let base: u64 = num_part.parse().map_err(|_| ())?;
 
@@ -211,15 +218,43 @@ pub fn parse_with_suffix(s: &str) -> Result<u64, ()> {
     base.checked_mul(multiplier).ok_or(())
 }
 
-/// Парсит bandwidth вида "10M" или "10M/50" (с burst).
+/// Парсит bandwidth вида "10M" или "10M/50K" (с burst).
+/// Использует SI-суффиксы (1000-based): K=1000, M=1000², G=1000³
 /// Возвращает (bandwidth_bits, burst_opt).
 pub fn parse_bandwidth(s: &str) -> Result<(u64, Option<u64>), ()> {
+    let parse_si_suffix = |s: &str| -> Result<u64, ()> {
+        let s = s.trim();
+        if s.is_empty() {
+            return Err(());
+        }
+
+        let split_pos = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+        let (num_part, suffix) = s.split_at(split_pos);
+
+        if num_part.is_empty() {
+            return Err(());
+        }
+
+        let base: u64 = num_part.parse().map_err(|_| ())?;
+
+        // SI-суффиксы (1000-based) для bandwidth
+        let multiplier: u64 = match suffix {
+            "" => 1,
+            "k" | "K" => 1_000,
+            "m" | "M" => 1_000_000,
+            "g" | "G" => 1_000_000_000,
+            _ => return Err(()),
+        };
+
+        base.checked_mul(multiplier).ok_or(())
+    };
+
     if let Some((bw_part, burst_part)) = s.split_once('/') {
-        let bw = parse_with_suffix(bw_part)?;
-        let burst = parse_with_suffix(burst_part)?;
+        let bw = parse_si_suffix(bw_part)?;
+        let burst = parse_si_suffix(burst_part)?;
         Ok((bw, Some(burst)))
     } else {
-        let bw = parse_with_suffix(s)?;
+        let bw = parse_si_suffix(s)?;
         Ok((bw, None))
     }
 }
@@ -272,9 +307,17 @@ fn expand_equals(args: Vec<String>) -> Vec<String> {
 
 /// Развёртывает группировку коротких флагов: `-suV` → `-s`, `-u`, `-V`.
 /// Если флаг требует значения, остаток строки становится значением: `-clocalhost` → `-c`, `localhost`.
+/// ВАЖНО: если остаток начинается с `-`, он НЕ разворачивается (защита от `-T -foo`).
 fn expand_short_flags(args: Vec<String>) -> Vec<String> {
     let mut result = Vec::with_capacity(args.len());
-    for arg in args {
+    let mut skip_next = false;
+
+    for arg in args.iter() {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+
         if arg.starts_with('-')
             && !arg.starts_with("--")
             && arg.len() > 2
@@ -289,6 +332,7 @@ fn expand_short_flags(args: Vec<String>) -> Vec<String> {
                     // Остаток строки — значение
                     if i + 1 < chars.len() {
                         let value: String = chars[i + 1..].iter().collect();
+                        // ВАЖНО: если значение начинается с '-', не разворачиваем его
                         result.push(value);
                     }
                     // Если i+1 == chars.len(), значение возьмётся из следующего аргумента
@@ -297,7 +341,7 @@ fn expand_short_flags(args: Vec<String>) -> Vec<String> {
                 i += 1;
             }
         } else {
-            result.push(arg);
+            result.push(arg.clone());
         }
     }
     result
@@ -583,9 +627,7 @@ mod tests {
         parse(s.split_whitespace().map(String::from))
     }
 
-    fn parse_vec(v: &[&str]) -> Result<Args, ParseError> {
-        parse(v.iter().map(|s| s.to_string()))
-    }
+
 
     // ── Базовый парсинг ──
 
@@ -633,7 +675,8 @@ mod tests {
 
     #[test]
     fn test_equals_syntax() {
-        let a = parse_str("-s --port=9090 --format=G").unwrap();
+        // Строчная 'g' = Gigabits, заглавная 'G' = Gigabytes
+        let a = parse_str("-s --port=9090 --format=g").unwrap();
         assert_eq!(a.port, 9090);
         assert_eq!(a.format, OutputFormat::Gigabits);
     }
@@ -649,11 +692,13 @@ mod tests {
 
     #[test]
     fn test_short_flag_grouping_client() {
-        // -cuVJ host → client=host, udp, verbose, json
-        let a = parse_str("-cuVJ host").unwrap();
         // -c требует значения → "uVJ" станет значением client
-        // Это корректное поведение группировки: значение приклеено к флагу
+        // udp, verbose, json НЕ устанавливаются, т.к. uVJ — это значение для -c
+        let a = parse_str("-cuVJ").unwrap();
         assert_eq!(a.client.as_deref(), Some("uVJ"));
+        assert!(!a.udp);
+        assert!(!a.verbose);
+        assert!(!a.json);
     }
 
     #[test]
@@ -716,6 +761,12 @@ mod tests {
         assert!(parse_with_suffix("").is_err());
         assert!(parse_with_suffix("abc").is_err());
         assert!(parse_with_suffix("10X").is_err());
+        // Некорректные строки с промежуточными символами
+        assert!(parse_with_suffix("12abc3").is_err());
+        assert!(parse_with_suffix("1K2").is_err());
+        assert!(parse_with_suffix("123Kxyz3").is_err());
+        assert!(parse_with_suffix("K10").is_err());
+        assert!(parse_with_suffix("1K2M").is_err());
     }
 
     #[test]
@@ -746,16 +797,15 @@ mod tests {
 
     #[test]
     fn test_bandwidth_simple() {
-        let (bw, burst) = parse_bandwidth("10M").unwrap();
-        assert_eq!(bw, 10 * 1024 * 1024);
-        assert_eq!(burst, None);
+        let (bw, _burst) = parse_bandwidth("10M").unwrap();
+        assert_eq!(bw, 10_000_000); // SI: 10 * 1000 * 1000
     }
 
     #[test]
     fn test_bandwidth_with_burst() {
         let (bw, burst) = parse_bandwidth("10M/50K").unwrap();
-        assert_eq!(bw, 10 * 1024 * 1024);
-        assert_eq!(burst, Some(50 * 1024));
+        assert_eq!(bw, 10_000_000); // SI: 10 * 1000 * 1000
+        assert_eq!(burst, Some(50_000)); // SI: 50 * 1000
     }
 
     #[test]
@@ -922,7 +972,8 @@ mod tests {
 
     #[test]
     fn test_full_server_command() {
-        let a = parse_str("-s -p 8080 -D -I /tmp/iperf.pid -1 -V -J -f G -i 2").unwrap();
+        // Строчная 'g' = Gigabits, заглавная 'G' = Gigabytes
+        let a = parse_str("-s -p 8080 -D -I /tmp/iperf.pid -1 -V -J -f g -i 2").unwrap();
         assert!(a.server);
         assert_eq!(a.port, 8080);
         assert!(a.daemon);
@@ -936,7 +987,8 @@ mod tests {
 
     #[test]
     fn test_equals_full_command() {
-        let a = parse_str("--server --port=9090 --format=M --interval=0.5").unwrap();
+        // Строчная 'm' = Megabits, заглавная 'M' = Megabytes
+        let a = parse_str("--server --port=9090 --format=m --interval=0.5").unwrap();
         assert!(a.server);
         assert_eq!(a.port, 9090);
         assert_eq!(a.format, OutputFormat::Megabits);

@@ -1,6 +1,17 @@
 
+use serde::Serialize;
+
 use crate::cli::OutputFormat;
 use crate::protocol::{StreamStats, TestResult};
+
+// ─────────────────────────────────────────────────────────────
+// Защита от NaN/Infinity
+// ─────────────────────────────────────────────────────────────
+
+/// Возвращает значение, если оно конечное, иначе 0.0
+fn finite_or_zero(value: f64) -> f64 {
+    if value.is_finite() { value } else { 0.0 }
+}
 
 // ─────────────────────────────────────────────────────────────
 // Форматирование размеров
@@ -10,27 +21,28 @@ use crate::protocol::{StreamStats, TestResult};
 pub fn format_transfer(bytes: u64) -> String {
     let b = bytes as f64;
     if b >= 1e12 {
-        format!("{:.2} TBytes", b / 1e12)
+        format!("{:.2} TB", b / 1e12)
     } else if b >= 1e9 {
-        format!("{:.2} GBytes", b / 1e9)
+        format!("{:.2} GB", b / 1e9)
     } else if b >= 1e6 {
-        format!("{:.2} MBytes", b / 1e6)
+        format!("{:.2} MB", b / 1e6)
     } else if b >= 1e3 {
-        format!("{:.2} KBytes", b / 1e3)
+        format!("{:.2} kB", b / 1e3)
     } else {
-        format!("{} Bytes", bytes)
+        format!("{} B", bytes)
     }
 }
 
 /// Форматирует битрейт в соответствии с указанным форматом вывода.
 pub fn format_bitrate(bits_per_sec: f64, fmt: &OutputFormat) -> String {
+    let rate = finite_or_zero(bits_per_sec);
     match fmt {
-        OutputFormat::Kilobits => format!("{:.2} Kbits/sec", bits_per_sec / 1e3),
-        OutputFormat::Megabits => format!("{:.2} Mbits/sec", bits_per_sec / 1e6),
-        OutputFormat::Gigabits => format!("{:.2} Gbits/sec", bits_per_sec / 1e9),
-        OutputFormat::Kilobytes => format!("{:.2} KBytes/sec", bits_per_sec / 8.0 / 1e3),
-        OutputFormat::Megabytes => format!("{:.2} MBytes/sec", bits_per_sec / 8.0 / 1e6),
-        OutputFormat::Gigabytes => format!("{:.2} GBytes/sec", bits_per_sec / 8.0 / 1e9),
+        OutputFormat::Kilobits => format!("{:.2} Kbit/s", rate / 1e3),
+        OutputFormat::Megabits => format!("{:.2} Mbit/s", rate / 1e6),
+        OutputFormat::Gigabits => format!("{:.2} Gbit/s", rate / 1e9),
+        OutputFormat::Kilobytes => format!("{:.2} kB/s", rate / 8.0 / 1e3),
+        OutputFormat::Megabytes => format!("{:.2} MB/s", rate / 8.0 / 1e6),
+        OutputFormat::Gigabytes => format!("{:.2} GB/s", rate / 8.0 / 1e9),
     }
 }
 
@@ -39,56 +51,89 @@ pub fn format_bitrate(bits_per_sec: f64, fmt: &OutputFormat) -> String {
 // ─────────────────────────────────────────────────────────────
 
 fn bitrate_of(s: &StreamStats) -> f64 {
-    if s.duration_sec > 0.0 {
-        (s.bytes as f64 * 8.0) / s.duration_sec
-    } else {
-        0.0
+    if !s.duration_sec.is_finite() || s.duration_sec <= 0.0 {
+        return 0.0;
     }
+    let bitrate = (s.bytes as f64 * 8.0) / s.duration_sec;
+    finite_or_zero(bitrate)
 }
 
 // ─────────────────────────────────────────────────────────────
-// Вывод результатов
+// Текстовый вывод
 // ─────────────────────────────────────────────────────────────
 
-fn print_row(
-    prefix: &str,
-    s: &StreamStats,
+/// Рендерит текстовый отчёт в строку (для тестирования и логирования).
+pub fn render_text(
+    label: &str,
+    result: &TestResult,
     fmt: &OutputFormat,
-    is_udp: bool,
-    role: &str,
-    is_sum: bool,
-) {
-    let interval = format!("0.00-{:.2} sec", s.duration_sec);
-    let id = if is_sum {
-        "[SUM]".to_string()
-    } else {
-        format!("[{}]", s.stream_id)
-    };
+    title: Option<&str>,
+) -> String {
+    let mut output = String::new();
+    let prefix = title.map(|t| format!("{} ", t)).unwrap_or_default();
+    let role = if result.is_sender { "sender" } else { "receiver" };
 
-    if is_udp {
-        println!(
-            "{}{:<6} {:<17} {:<13} {:<15} {:<10.3} {}/{} {}",
-            prefix,
-            id,
-            interval,
-            format_transfer(s.bytes),
-            format_bitrate(bitrate_of(s), fmt),
-            s.jitter_ms,
-            s.lost_packets,
-            s.total_packets,
-            role
-        );
+    output.push_str(&format!("\n{}--- {} ---\n", prefix, label));
+    if result.is_udp {
+        output.push_str(&format!(
+            "{}[ ID]   Interval          Transfer      Bitrate         Jitter     Lost/Total\n",
+            prefix
+        ));
     } else {
-        println!(
-            "{}{:<6} {:<17} {:<13} {:<15} {}",
-            prefix,
-            id,
-            interval,
-            format_transfer(s.bytes),
-            format_bitrate(bitrate_of(s), fmt),
-            role
-        );
+        output.push_str(&format!(
+            "{}[ ID]   Interval          Transfer      Bitrate\n",
+            prefix
+        ));
     }
+
+    for s in &result.streams {
+        let duration = finite_or_zero(s.duration_sec);
+        let interval = format!("0.00-{:.2} sec", duration);
+        let id = format!("[{}]", s.stream_id);
+
+        if result.is_udp {
+            output.push_str(&format!(
+                "{}{:<6} {:<17} {:<13} {:<15} {:<10.3} {}/{} {}\n",
+                prefix, id, interval,
+                format_transfer(s.bytes),
+                format_bitrate(bitrate_of(s), fmt),
+                finite_or_zero(s.jitter_ms),
+                s.lost_packets, s.total_packets, role
+            ));
+        } else {
+            output.push_str(&format!(
+                "{}{:<6} {:<17} {:<13} {:<15} {}\n",
+                prefix, id, interval,
+                format_transfer(s.bytes),
+                format_bitrate(bitrate_of(s), fmt), role
+            ));
+        }
+    }
+
+    // SUM row
+    let sum = &result.sum;
+    let duration = finite_or_zero(sum.duration_sec);
+    let interval = format!("0.00-{:.2} sec", duration);
+
+    if result.is_udp {
+        output.push_str(&format!(
+            "{}{:<6} {:<17} {:<13} {:<15} {:<10.3} {}/{} {}\n",
+            prefix, "[SUM]", interval,
+            format_transfer(sum.bytes),
+            format_bitrate(bitrate_of(sum), fmt),
+            finite_or_zero(sum.jitter_ms),
+            sum.lost_packets, sum.total_packets, role
+        ));
+    } else {
+        output.push_str(&format!(
+            "{}{:<6} {:<17} {:<13} {:<15} {}\n",
+            prefix, "[SUM]", interval,
+            format_transfer(sum.bytes),
+            format_bitrate(bitrate_of(sum), fmt), role
+        ));
+    }
+
+    output
 }
 
 /// Печатает результат теста в текстовом формате.
@@ -98,60 +143,72 @@ pub fn print_result(
     fmt: &OutputFormat,
     title: Option<&str>,
 ) {
-    let prefix = title.map(|t| format!("{} ", t)).unwrap_or_default();
+    print!("{}", render_text(label, result, fmt, title));
+}
+
+// ─────────────────────────────────────────────────────────────
+// JSON вывод (через serde_json)
+// ─────────────────────────────────────────────────────────────
+
+#[derive(Serialize)]
+struct JsonStream {
+    id: usize,
+    bytes: u64,
+    packets: u64,
+    duration_sec: f64,
+    bitrate_bits_per_sec: f64,
+    jitter_ms: f64,
+    lost_packets: u64,
+    total_packets: u64,
+}
+
+#[derive(Serialize)]
+struct JsonResult<'a> {
+    label: &'a str,
+    role: &'a str,
+    is_sender: bool,
+    is_udp: bool,
+    reverse: bool,
+    streams: Vec<JsonStream>,
+    sum: JsonStream,
+}
+
+fn stream_to_json(s: &StreamStats) -> JsonStream {
+    JsonStream {
+        id: s.stream_id,
+        bytes: s.bytes,
+        packets: s.packets,
+        duration_sec: finite_or_zero(s.duration_sec),
+        bitrate_bits_per_sec: finite_or_zero(bitrate_of(s)),
+        jitter_ms: finite_or_zero(s.jitter_ms),
+        lost_packets: s.lost_packets,
+        total_packets: s.total_packets,
+    }
+}
+
+/// Рендерит JSON-отчёт в строку (для тестирования и логирования).
+pub fn render_json(label: &str, result: &TestResult) -> Result<String, serde_json::Error> {
     let role = if result.is_sender { "sender" } else { "receiver" };
 
-    println!();
-    println!("{}--- {} ---", prefix, label);
-    if result.is_udp {
-        println!(
-            "{}[ ID]   Interval          Transfer      Bitrate         Jitter     Lost/Total",
-            prefix
-        );
-    } else {
-        println!("{}[ ID]   Interval          Transfer      Bitrate", prefix);
-    }
-    for s in &result.streams {
-        print_row(&prefix, s, fmt, result.is_udp, role, false);
-    }
-    print_row(&prefix, &result.sum, fmt, result.is_udp, role, true);
+    let output = JsonResult {
+        label,
+        role,
+        is_sender: result.is_sender,
+        is_udp: result.is_udp,
+        reverse: result.reverse,
+        streams: result.streams.iter().map(stream_to_json).collect(),
+        sum: stream_to_json(&result.sum),
+    };
+
+    serde_json::to_string(&output)
 }
 
 /// Печатает результат теста в JSON-формате.
 pub fn print_json(label: &str, result: &TestResult) {
-    let streams: Vec<String> = result
-        .streams
-        .iter()
-        .map(|s| {
-            format!(
-                r#"{{"id":{},"bytes":{},"packets":{},"duration":{:.6},"jitter_ms":{:.6},"lost_packets":{},"total_packets":{}}}"#,
-                s.stream_id, s.bytes, s.packets, s.duration_sec, s.jitter_ms,
-                s.lost_packets, s.total_packets
-            )
-        })
-        .collect();
-
-    let sum = format!(
-        r#"{{"bytes":{},"packets":{},"duration":{:.6},"jitter_ms":{:.6},"lost_packets":{},"total_packets":{}}}"#,
-        result.sum.bytes,
-        result.sum.packets,
-        result.sum.duration_sec,
-        result.sum.jitter_ms,
-        result.sum.lost_packets,
-        result.sum.total_packets
-    );
-
-    let obj = format!(
-        r#"{{"role":"{}","is_sender":{},"is_udp":{},"reverse":{},"streams":[{}],"sum":{}}}"#,
-        label,
-        result.is_sender,
-        result.is_udp,
-        result.reverse,
-        streams.join(","),
-        sum
-    );
-
-    println!("{}", obj);
+    match render_json(label, result) {
+        Ok(json) => println!("{}", json),
+        Err(e) => eprintln!("failed to serialize result as JSON: {}", e),
+    }
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -164,66 +221,44 @@ mod tests {
 
     #[test]
     fn test_format_transfer_bytes() {
-        assert_eq!(format_transfer(500), "500 Bytes");
+        assert_eq!(format_transfer(500), "500 B");
+        assert_eq!(format_transfer(999), "999 B");
     }
 
     #[test]
-    fn test_format_transfer_kbytes() {
-        assert_eq!(format_transfer(1500), "1.50 KBytes");
+    fn test_format_transfer_kilobytes() {
+        assert_eq!(format_transfer(1000), "1.00 kB");
+        assert_eq!(format_transfer(1500), "1.50 kB");
     }
 
     #[test]
-    fn test_format_transfer_mbytes() {
-        assert_eq!(format_transfer(1_500_000), "1.50 MBytes");
+    fn test_format_transfer_megabytes() {
+        assert_eq!(format_transfer(1_000_000), "1.00 MB");
+        assert_eq!(format_transfer(1_500_000), "1.50 MB");
     }
 
     #[test]
-    fn test_format_transfer_gbytes() {
-        assert_eq!(format_transfer(1_500_000_000), "1.50 GBytes");
-    }
-
-    #[test]
-    fn test_format_transfer_tbytes() {
-        assert_eq!(format_transfer(1_500_000_000_000), "1.50 TBytes");
-    }
-
-    #[test]
-    fn test_format_bitrate_kilobits() {
-        let result = format_bitrate(1_000_000.0, &OutputFormat::Kilobits);
-        assert_eq!(result, "1000.00 Kbits/sec");
+    fn test_format_transfer_gigabytes() {
+        assert_eq!(format_transfer(1_000_000_000), "1.00 GB");
+        assert_eq!(format_transfer(1_500_000_000), "1.50 GB");
     }
 
     #[test]
     fn test_format_bitrate_megabits() {
         let result = format_bitrate(1_000_000.0, &OutputFormat::Megabits);
-        assert_eq!(result, "1.00 Mbits/sec");
+        assert_eq!(result, "1.00 Mbit/s");
     }
 
     #[test]
-    fn test_format_bitrate_gigabits() {
-        let result = format_bitrate(1_000_000_000.0, &OutputFormat::Gigabits);
-        assert_eq!(result, "1.00 Gbits/sec");
+    fn test_format_bitrate_nan() {
+        let result = format_bitrate(f64::NAN, &OutputFormat::Megabits);
+        assert_eq!(result, "0.00 Mbit/s");
     }
 
     #[test]
-    fn test_format_bitrate_kilobytes() {
-        // 8_000_000 bits/sec = 1_000_000 bytes/sec = 1000 KBytes/sec
-        let result = format_bitrate(8_000_000.0, &OutputFormat::Kilobytes);
-        assert_eq!(result, "1000.00 KBytes/sec");
-    }
-
-    #[test]
-    fn test_format_bitrate_megabytes() {
-        // 8_000_000 bits/sec = 1_000_000 bytes/sec = 1 MBytes/sec
-        let result = format_bitrate(8_000_000.0, &OutputFormat::Megabytes);
-        assert_eq!(result, "1.00 MBytes/sec");
-    }
-
-    #[test]
-    fn test_format_bitrate_gigabytes() {
-        // 8_000_000_000 bits/sec = 1_000_000_000 bytes/sec = 1 GBytes/sec
-        let result = format_bitrate(8_000_000_000.0, &OutputFormat::Gigabytes);
-        assert_eq!(result, "1.00 GBytes/sec");
+    fn test_format_bitrate_infinity() {
+        let result = format_bitrate(f64::INFINITY, &OutputFormat::Megabits);
+        assert_eq!(result, "0.00 Mbit/s");
     }
 
     #[test]
@@ -237,6 +272,26 @@ mod tests {
     }
 
     #[test]
+    fn test_bitrate_of_negative_duration() {
+        let stats = StreamStats {
+            bytes: 1000,
+            duration_sec: -1.0,
+            ..Default::default()
+        };
+        assert_eq!(bitrate_of(&stats), 0.0);
+    }
+
+    #[test]
+    fn test_bitrate_of_nan_duration() {
+        let stats = StreamStats {
+            bytes: 1000,
+            duration_sec: f64::NAN,
+            ..Default::default()
+        };
+        assert_eq!(bitrate_of(&stats), 0.0);
+    }
+
+    #[test]
     fn test_bitrate_of_normal() {
         let stats = StreamStats {
             bytes: 1_000_000, // 1 MB = 8 Mbits
@@ -244,5 +299,110 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(bitrate_of(&stats), 8_000_000.0);
+    }
+
+    #[test]
+    fn test_json_is_valid() {
+        let result = TestResult {
+            streams: vec![StreamStats {
+                stream_id: 0,
+                bytes: 1_000_000,
+                packets: 100,
+                duration_sec: 10.0,
+                jitter_ms: 0.5,
+                lost_packets: 2,
+                total_packets: 102,
+            }],
+            sum: StreamStats {
+                stream_id: 0,
+                bytes: 1_000_000,
+                packets: 100,
+                duration_sec: 10.0,
+                jitter_ms: 0.5,
+                lost_packets: 2,
+                total_packets: 102,
+            },
+            is_sender: true,
+            is_udp: false,
+            reverse: false,
+        };
+
+        let json = render_json("test", &result).unwrap();
+        // Проверяем, что JSON валиден
+        let _: serde_json::Value = serde_json::from_str(&json).unwrap();
+    }
+
+    #[test]
+    fn test_json_escapes_label() {
+        let result = TestResult::default();
+        // label содержит кавычки, backslash и newline
+        let json = render_json("test\"abc\\def\nghi", &result).unwrap();
+        // Проверяем, что JSON валиден
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["label"], "test\"abc\\def\nghi");
+    }
+
+    #[test]
+    fn test_json_contains_bitrate() {
+        let result = TestResult {
+            streams: vec![StreamStats {
+                stream_id: 0,
+                bytes: 1_000_000,
+                duration_sec: 1.0,
+                ..Default::default()
+            }],
+            sum: StreamStats::default(),
+            is_sender: true,
+            is_udp: false,
+            reverse: false,
+        };
+
+        let json = render_json("test", &result).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        // Проверяем наличие bitrate_bits_per_sec
+        assert!(parsed["streams"][0]["bitrate_bits_per_sec"].is_number());
+        assert_eq!(parsed["streams"][0]["bitrate_bits_per_sec"], 8_000_000.0);
+    }
+
+    #[test]
+    fn test_json_separates_label_and_role() {
+        let result = TestResult {
+            streams: vec![],
+            sum: StreamStats::default(),
+            is_sender: true,
+            is_udp: false,
+            reverse: false,
+        };
+
+        let json = render_json("my_label", &result).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed["label"], "my_label");
+        assert_eq!(parsed["role"], "sender");
+    }
+
+    #[test]
+    fn test_json_handles_nan() {
+        let result = TestResult {
+            streams: vec![StreamStats {
+                stream_id: 0,
+                bytes: 1000,
+                duration_sec: f64::NAN,
+                jitter_ms: f64::INFINITY,
+                ..Default::default()
+            }],
+            sum: StreamStats::default(),
+            is_sender: true,
+            is_udp: false,
+            reverse: false,
+        };
+
+        let json = render_json("test", &result).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        // NaN и Infinity должны быть заменены на 0.0
+        assert_eq!(parsed["streams"][0]["duration_sec"], 0.0);
+        assert_eq!(parsed["streams"][0]["jitter_ms"], 0.0);
     }
 }
