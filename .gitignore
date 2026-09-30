@@ -1,1 +1,7 @@
 /target
+*.d
+/riperf
+/deps
+
+
+
